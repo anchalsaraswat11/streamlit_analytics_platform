@@ -15,29 +15,11 @@ from agent.tools.scoring import score_order
 from agent.tools.policy_rag import query_policy
 from agent.tools.product import lookup_product
 
-# The agent's reasoning loop (ReAct) still needs an LLM to interpret requests
-# and choose tools — that part isn't mockable the way scoring/retrieval are.
-# OrderLookup, ScoreOrder, and PolicyRAG all run fully locally in demo mode
-#  so this is the only external dependency left: an
-# OpenAI API key. Demo mode defaults to gpt-4o-mini to keep that cost close to nothing
-
-APP_MODE = os.environ.get("APP_MODE", "demo")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-DEFAULT_MODEL = "gpt-4o" if APP_MODE == "live" else "gpt-4o-mini"
-MODEL_NAME = os.environ.get("OPENAI_MODEL", DEFAULT_MODEL)
-
 
 def build_executor():
-    if not OPENAI_API_KEY:
-        raise RuntimeError(
-            "OPENAI_API_KEY is not set. The agent's reasoning loop requires an "
-            "OpenAI key to run (tool selection, response generation) — this is "
-            "the one dependency demo mode can't remove. Set OPENAI_API_KEY in "
-            "your .env and try again."
-        )
-
     llm = ChatOpenAI(
-        model=MODEL_NAME,
+        model="gpt-4o",
         temperature=0,
         api_key=OPENAI_API_KEY
     )
@@ -76,7 +58,7 @@ You can: look up orders, score customer LTV, answer policy questions, look up pr
 You cannot: process refunds, make account changes, or take any actions — inform only.
 If asked something outside these capabilities, politely decline.
 Always cite the policy section when answering policy questions.
-Never fabricate a score — only return one if scoring was actually performed."""
+Never fabricate a score — only return one if the SageMaker endpoint was called successfully."""
 
     prompt = hub.pull("hwchase17/react-chat")
 

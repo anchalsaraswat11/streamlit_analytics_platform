@@ -2,25 +2,17 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import pandas as pd
+import boto3
 import json
 import os
-from agent.tools.lookup import lookup_order, CSV_PATH
+from agent.tools.lookup import lookup_order
 
-# The Scoring Tool is what actually calls our SageMaker model. It takes an order ID,
-# prepares the data the model expects, calls the endpoint, and returns a predicted customer LTV
-# — how much that customer is expected to spend in the next 90 days — along with a risk tier and a
-# plain English explanation.
-#
-# APP_MODE controls where the score comes from:
-#   - "live" (default for the real deployment): calls the actual SageMaker endpoint.
-#   - "demo" (default when APP_MODE is unset): trains a local XGBoost model on the same
-#     training CSV and feature set, and scores in-process. Same features, same target,
-#     same encoding — just running locally instead of behind a hosted endpoint, so this
-#     works with no AWS account.
+# The Scoring Tool is what actually calls our SageMaker model. It takes an order ID, 
+# prepares the data the model expects, calls the endpoint, and returns a predicted customer LTV 
+# — how much that customer is expected to spend in the next 90 days — along with a risk tier and a 
+# plain English explanation
 
-APP_MODE = os.getenv("APP_MODE", "demo")
-
-# The exact 39 columns my SageMaker endpoint was trained on
+# The exact 39 columns my SageMaker endpoint was trained on 
 TRAINING_COLUMNS = [
     'num_items', 'num_distinct_products', 'order_total',
     'shipping_matches_billing', 'user_session_count_7d',
@@ -40,16 +32,9 @@ TRAINING_COLUMNS = [
 
 # Columns to drop before encoding — not features
 DROP_COLUMNS = ['order_id', 'user_id', 'customer_ltv_90d', 'churned_within_60d', 'returned_order']
-TARGET_COLUMN = 'customer_ltv_90d'
 
 SAGEMAKER_ENDPOINT = os.getenv("SAGEMAKER_ENDPOINT")
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
-
-LOCAL_MODEL_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "../../local_ltv_model.json"
-)
-
-_local_model = None  # cached in-process after first load/train
 
 
 def encode_row(raw_row: dict) -> pd.DataFrame:
@@ -58,16 +43,16 @@ def encode_row(raw_row: dict) -> pd.DataFrame:
     the exact 39-column float vector the endpoint expects.
     """
     df = pd.DataFrame([raw_row])
-
+    
     # Drop non-feature columns
     df = df.drop(columns=[c for c in DROP_COLUMNS if c in df.columns])
-
+    
     # One-hot encode categoricals
     df = pd.get_dummies(df).astype(float)
-
+    
     # Reindex to exact training column order, fill missing with 0
     df = df.reindex(columns=TRAINING_COLUMNS, fill_value=0.0)
-
+    
     return df
 
 
@@ -80,68 +65,11 @@ def get_risk_tier(predicted_ltv: float) -> str:
         return "high"
 
 
-def _train_local_model():
-    """
-    Trains a local XGBoost regressor on the same training CSV and feature set
-    the SageMaker endpoint was trained on. This is a real model trained on
-    real project data — it just runs in-process instead of behind a hosted
-    endpoint, so the demo works without an AWS account.
-    """
-    import xgboost as xgb
-
-    df = pd.read_csv(CSV_PATH)
-    y = df[TARGET_COLUMN]
-    X = df.drop(columns=[c for c in DROP_COLUMNS if c in df.columns])
-    X = pd.get_dummies(X).astype(float).reindex(columns=TRAINING_COLUMNS, fill_value=0.0)
-
-    model = xgb.XGBRegressor(
-        n_estimators=200,
-        max_depth=4,
-        learning_rate=0.05,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        random_state=42,
-    )
-    model.fit(X, y)
-    model.save_model(LOCAL_MODEL_PATH)
-    return model
-
-
-def _get_local_model():
-    global _local_model
-    if _local_model is None:
-        import xgboost as xgb
-
-        if os.path.exists(LOCAL_MODEL_PATH):
-            _local_model = xgb.XGBRegressor()
-            _local_model.load_model(LOCAL_MODEL_PATH)
-        else:
-            _local_model = _train_local_model()
-    return _local_model
-
-
-def _score_live(encoded: pd.DataFrame) -> float:
-    import boto3  # only required in live mode — not a demo-mode dependency
-    client = boto3.client("sagemaker-runtime", region_name=AWS_REGION)
-    payload = encoded.to_csv(index=False, header=False)
-    response = client.invoke_endpoint(
-        EndpointName=SAGEMAKER_ENDPOINT,
-        ContentType="text/csv",
-        Body=payload
-    )
-    return float(response['Body'].read().decode('utf-8').strip())
-
-
-def _score_demo(encoded: pd.DataFrame) -> float:
-    model = _get_local_model()
-    return float(model.predict(encoded)[0])
-
-
 def score_order(order_id: str) -> dict:
     """
-    Looks up an order, encodes it, scores it (locally in demo mode, via
-    SageMaker in live mode), and returns predicted LTV, risk tier, and
-    explanation. Never returns a score if scoring wasn't actually performed.
+    Looks up an order, encodes it, calls SageMaker, and returns
+    predicted LTV, risk tier, and explanation.
+    Never returns a score if the endpoint wasn't actually called.
     """
     # Step 1: lookup
     raw_row = lookup_order(order_id)
@@ -154,14 +82,18 @@ def score_order(order_id: str) -> dict:
     except Exception as e:
         return {"error": f"Encoding failed: {str(e)}"}
 
-    # Step 3: score
+    # Step 3: call SageMaker
     try:
-        if APP_MODE == "live":
-            predicted_ltv = _score_live(encoded)
-        else:
-            predicted_ltv = _score_demo(encoded)
+        client = boto3.client("sagemaker-runtime", region_name=AWS_REGION)
+        payload = encoded.to_csv(index=False, header=False)
+        response = client.invoke_endpoint(
+            EndpointName=SAGEMAKER_ENDPOINT,
+            ContentType="text/csv",
+            Body=payload
+        )
+        predicted_ltv = float(response['Body'].read().decode('utf-8').strip())
     except Exception as e:
-        return {"error": f"Scoring failed ({APP_MODE} mode): {str(e)}"}
+        return {"error": f"SageMaker endpoint call failed: {str(e)}"}
 
     # Step 4: build result
     tier = get_risk_tier(predicted_ltv)
@@ -170,7 +102,6 @@ def score_order(order_id: str) -> dict:
         "user_id": raw_row.get("user_id"),
         "predicted_ltv": round(predicted_ltv, 2),
         "risk_tier": tier,
-        "scored_via": "local_xgboost" if APP_MODE != "live" else "sagemaker_endpoint",
         "explanation": (
             f"This customer is predicted to spend ${predicted_ltv:.2f} "
             f"in the next 90 days, placing them in the {tier} value tier."
@@ -191,14 +122,13 @@ def score_order(order_id: str) -> dict:
     return json.dumps(result)
 
 
-# Test scoring end to end — works in demo mode with no AWS/OpenAI needed
+# Test encoding only — no SageMaker needed yet
 if __name__ == "__main__":
-    print(f"APP_MODE={APP_MODE}")
     raw = lookup_order("ORD-17633387")
     encoded = encode_row(raw)
     print(f"Encoded shape: {encoded.shape}")
     print(f"Columns match training: {list(encoded.columns) == TRAINING_COLUMNS}")
     print(f"Any nulls: {encoded.isnull().any().any()}")
     print()
-    print("Score result:")
-    print(score_order("ORD-17633387"))
+    print("First few values:")
+    print(encoded.iloc[0].to_dict())
