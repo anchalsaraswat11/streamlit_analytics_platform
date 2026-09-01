@@ -8,7 +8,11 @@ langchain
 langchain-openai
 langchain-pinecone
 langchain-community
+langchain-huggingface
 pinecone-client
 python-docx
 docx2txt
 openai
+xgboost
+sentence-transformers
+faiss-cpu
